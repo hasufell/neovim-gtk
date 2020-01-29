@@ -291,6 +291,8 @@ pub fn call(
         "wildmenu_show" => call!(ui->wildmenu_show(args: ext)),
         "wildmenu_hide" => ui.wildmenu_hide(),
         "wildmenu_select" => call!(ui->wildmenu_select(args: int)),
+        "win_viewport" => call!(ui->win_viewport(args: int, val_ref, int, int, int, int)),
+        "flush" => ui.flush(),
         _ => {
             warn!("Event {}({:?})", method, args);
             RepaintMode::Nothing

@@ -25,6 +25,7 @@ mod file_browser;
 mod grid;
 mod highlight;
 mod input;
+#[macro_use]
 mod misc;
 mod nvim;
 mod plug_manager;

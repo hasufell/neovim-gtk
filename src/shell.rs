@@ -4,7 +4,6 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use clap::{self, value_t};
 
@@ -18,7 +17,7 @@ use pango;
 use pango::FontDescription;
 use pangocairo;
 
-use neovim_lib::neovim_api::Tabpage;
+use neovim_lib::neovim_api::{Tabpage,Window};
 use neovim_lib::{Neovim, NeovimApi, NeovimApiAsync, Value};
 
 use crate::color::{Color, COLOR_BLACK, COLOR_WHITE};
@@ -44,6 +43,11 @@ use crate::render::CellMetrics;
 use crate::subscriptions::{SubscriptionHandle, SubscriptionKey, Subscriptions};
 use crate::tabline::Tabline;
 use crate::ui::UiMutex;
+use crate::{try_w,check};
+use neovim_lib::neovim_api::Window as NvimWindow;
+use std::sync::mpsc::channel;
+use std::time::{Duration, Instant};
+
 
 const DEFAULT_FONT_NAME: &str = "DejaVu Sans Mono 12";
 pub const MINIMUM_SUPPORTED_NVIM_VERSION: &str = "0.3.2";
@@ -127,6 +131,7 @@ pub struct State {
 
     stack: gtk::Stack,
     pub drawing_area: gtk::DrawingArea,
+    pub scrollbar: gtk::Scrollbar,
     tabs: Tabline,
     im_context: gtk::IMMulticontext,
     error_area: error::ErrorArea,
@@ -144,6 +149,7 @@ pub struct State {
 impl State {
     pub fn new(settings: Rc<RefCell<Settings>>, options: ShellOptions) -> State {
         let drawing_area = gtk::DrawingArea::new();
+        let scrollbar = gtk::Scrollbar::new::<gtk::Adjustment>(gtk::Orientation::Vertical, None);
 
         let pango_context = drawing_area.create_pango_context().unwrap();
         pango_context.set_font_description(&FontDescription::from_string(DEFAULT_FONT_NAME));
@@ -174,6 +180,7 @@ impl State {
             // UI
             stack: gtk::Stack::new(),
             drawing_area,
+            scrollbar,
             tabs: Tabline::new(),
             im_context: gtk::IMMulticontext::new(),
             error_area: error::ErrorArea::new(),
@@ -539,6 +546,46 @@ impl State {
 
         self.command_cb = cb;
     }
+
+    /**
+     * Initialize the scrollbar.
+     */
+    pub fn init_scrollbar(&self) {
+        let mut nvim = try_w!(self.try_nvim().ok_or("Couldn't grab nvim"));
+        let win = try_w!(nvim.get_current_win());
+        let buf = try_w!(win.get_buf(&mut nvim));
+        let (col, _) = try_w!(win.get_cursor(&mut nvim));
+
+        let from = 0;
+
+        let win_height = try_w!(win.get_height(&mut nvim));
+        let to = buf.line_count(&mut nvim).unwrap_or(1) + win_height;
+
+        self.scrollbar.set_fill_level(to as f64);
+        let adjustment = gtk::Adjustment::new(col as f64,
+            from as f64,
+            to as f64,
+            0.0,
+            0.0,
+            win_height as f64);
+        self.scrollbar.set_adjustment(&adjustment);
+    }
+
+    /**
+     * Update the value (current position) of the scrollbar. If `None`
+     * is passed, then looks up current cursor position in the window.
+     */
+    pub fn update_scrollbar_value(&self, val: Option<f64>) {
+        match val {
+            Some(v) => self.scrollbar.set_value(v as f64),
+            None => {
+                let mut nvim = try_w!(self.try_nvim().ok_or("Couldn't grab nvim"));
+                let win = try_w!(nvim.get_current_win());
+                let (col, _) = try_w!(win.get_cursor(&mut nvim));
+                self.scrollbar.set_value(col as f64);
+            }
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -552,8 +599,11 @@ pub struct UiState {
     mouse_pressed: bool,
     scroll_delta: (f64, f64),
 
-    // previous editor position (col, row)
-    prev_pos: (u64, u64),
+    // previous editor position during a mouse drag (col, row)
+    prev_drag_pos: (u64, u64),
+
+    scrollbar_dragging: bool,
+    last_scrollbar_event: Instant,
 
     mouse_cursor: MouseCursor,
 }
@@ -563,7 +613,9 @@ impl UiState {
         UiState {
             mouse_pressed: false,
             scroll_delta: (0.0, 0.0),
-            prev_pos: (0, 0),
+            prev_drag_pos: (0, 0),
+            scrollbar_dragging: false,
+            last_scrollbar_event: Instant::now(),
 
             mouse_cursor: MouseCursor::None,
         }
@@ -665,7 +717,11 @@ impl Shell {
         nvim_box.pack_start(&*state.tabs, false, true, 0);
         nvim_box.pack_start(&state.drawing_area, true, true, 0);
 
-        state.stack.add_named(&nvim_box, "Nvim");
+        let scrollbar_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        scrollbar_box.pack_start(&nvim_box, true, true, 0);
+        scrollbar_box.pack_start(&state.scrollbar, false, false, 0);
+
+        state.stack.add_named(&scrollbar_box, "Nvim");
         state.stack.add_named(&*state.error_area, "Error");
 
         self.widget.pack_start(&state.stack, true, true, 0);
@@ -680,6 +736,82 @@ impl Shell {
                 | gdk::EventMask::LEAVE_NOTIFY_MASK
                 | gdk::EventMask::POINTER_MOTION_MASK,
         );
+
+        let ref_state = self.state.clone();
+        self.state.borrow().subscribe(
+            SubscriptionKey::from("BufWinEnter,WinEnter"),
+            &[""],
+            move |_| ref_state.borrow().init_scrollbar(),
+        );
+
+        // let ref_state = self.state.clone();
+        // self.state.borrow().subscribe(
+            // SubscriptionKey::from("CursorMoved"),
+            // &[""],
+            // move |_| ref_state.borrow().update_scrollbar_value(None),
+        // );
+
+        let ref_shell = self.clone();
+        let ref_state = self.state.clone();
+        let ref_ui_state = self.ui_state.clone();
+        state
+            .scrollbar
+            .connect_change_value(move |_, st, val| {
+                // TODO: compare with old value and skip. Maybe debounce?
+                let state = ref_state.borrow();
+                // let input_str = format!("{}", "<ScrollWheelUp>");
+                let mut nvim = try_wr!(state.try_nvim().ok_or("Couldn't grab nvim"), Inhibit(true));
+                let win = try_wr!(nvim.get_current_win(), Inhibit(true));
+                let (_, y) = try_wr!(win.get_cursor(&mut nvim), Inhibit(true));
+                println!("Scrolltype: {}", st);
+                println!("Scroll val: {}", val);
+                let pos = (val.trunc() as i64, y);
+
+                let ui_state = ref_ui_state.borrow_mut();
+                // ui_state.prev_scrollbar_val
+
+                let duration = ui_state.last_scrollbar_event.elapsed().as_millis();
+                if duration > 50 && ui_state.scrollbar_dragging {
+                    println!("duration: {:?}", duration);
+                    win.set_cursor(&mut nvim, pos);
+                    // ui_state.last_scrollbar_event = Instant::now();
+                }
+                Inhibit(true)
+            });
+
+        let ref_ui_state = self.ui_state.clone();
+        state
+            .scrollbar
+            .connect_button_press_event(move |_, button| {
+                let mut ui_state = ref_ui_state.borrow_mut();
+                match button.get_button() {
+                    1 => ui_state.scrollbar_dragging = true,
+                    _ => (),
+                }
+                println!("Drag begin");
+                Inhibit(false)
+            });
+
+        let ref_ui_state = self.ui_state.clone();
+        state
+            .scrollbar
+            .connect_button_release_event(move |_, button| {
+                let mut ui_state = ref_ui_state.borrow_mut();
+                match button.get_button() {
+                    1 => ui_state.scrollbar_dragging = false,
+                    _ => (),
+                }
+                println!("Drag release");
+                Inhibit(false)
+            });
+
+        let ref_shell = self.clone();
+        let ref_state = self.state.clone();
+        state
+            .scrollbar
+            .connect_move_slider(move |_, _| {
+                println!("Move slider");
+            });
 
         let menu = self.create_context_menu();
         let ref_state = self.state.clone();
@@ -1096,9 +1228,9 @@ fn gtk_motion_notify(shell: &mut State, ui_state: &mut UiState, ev: &EventMotion
 
         // if we fire LeftDrag on the same coordinates multiple times, then
         // we get: https://github.com/daa84/neovim-gtk/issues/185
-        if pos != ui_state.prev_pos {
+        if pos != ui_state.prev_drag_pos {
             mouse_input(shell, "LeftDrag", ev.get_state(), ev_pos);
-            ui_state.prev_pos = pos;
+            ui_state.prev_drag_pos = pos;
         }
     }
 
@@ -1628,6 +1760,17 @@ impl State {
 
     pub fn wildmenu_select(&self, selected: i64) -> RepaintMode {
         self.cmd_line.wildmenu_select(selected);
+        RepaintMode::Nothing
+    }
+
+    pub fn win_viewport(&mut self, grid: i64, val: &Value, topline: i64, botline: i64, curline: i64, curcol: i64) -> RepaintMode {
+        println!("win_viewport: top {} bot {} cur {}", topline, botline, curline);
+        self.update_scrollbar_value(Some(curline as f64));
+        RepaintMode::Nothing
+    }
+
+    pub fn flush(&mut self) -> RepaintMode {
+        println!("Flush");
         RepaintMode::Nothing
     }
 }
